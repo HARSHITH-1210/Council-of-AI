@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[oc]
+
+# Virtual environment
+.venv
+
+# Secrets
+.env
+
+# Saved conversations
+data/
+
+# Local editor/tooling config
+.claude/
