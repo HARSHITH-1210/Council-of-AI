@@ -127,21 +127,120 @@ Council-of-AI/
 └── .env                    # Your API key (create this yourself, not committed)
 ```
 
-### Under the hood: the LangGraph workflow
+---
+
+## 🧠 Graph architecture
+
+The backend is a single LangGraph **`StateGraph`** defined in [`backend/graph.py`](backend/graph.py) and compiled once as `council_graph`. The Streamlit app calls it directly, with no web server or API in between.
+
+### System overview
 
 ```mermaid
 flowchart LR
-    START([START]) -- "Send × N" --> CM[council_member]
-    START -- "Send (first message)" --> T[title] --> E1([END])
-    CM --> PR[prepare_review]
-    PR -- "Send × N" --> RV[reviewer]
-    PR -- "all models failed" --> NR[no_responses] --> E2([END])
-    RV --> AG[aggregate] --> CH[chairman] --> E3([END])
+    U(["👤 User"]) <--> UI["Streamlit UI<br/>app.py + frontend/"]
+    UI -- "astream(question)" --> G["LangGraph<br/>council_graph"]
+    G -- "live progress updates" --> UI
+    G <--> OR["OpenRouter API<br/>backend/llm.py"]
+    UI <--> DB[("JSON storage<br/>data/conversations/")]
 ```
 
-- **`Send`** launches one `council_member` / `reviewer` task **per model in parallel**, so the total wait is about as long as the slowest model, not the sum of all of them.
-- **`prepare_review`** waits for all Stage 1 answers, assigns the anonymous labels, and builds the review prompt.
-- The app streams graph updates (`astream`) to show progress as each model finishes.
+### The workflow graph
+
+```mermaid
+flowchart TD
+    START([START])
+
+    subgraph S1["Stage 1 · First opinions"]
+        CM["council_member<br/>1 task per model, in parallel"]
+    end
+
+    subgraph S2["Stage 2 · Peer review"]
+        PR["prepare_review<br/>anonymize + build prompt"]
+        RV["reviewer<br/>1 task per model, in parallel"]
+        AG["aggregate<br/>average the rankings"]
+    end
+
+    subgraph S3["Stage 3 · Synthesis"]
+        CH["chairman<br/>write the final answer"]
+    end
+
+    START -- "Send × N" --> CM
+    START -. "Send (first message only)" .-> T["title"]
+    CM --> PR
+    PR -- "Send × N" --> RV
+    PR -. "no Stage 1 answers" .-> NR["no_responses"]
+    RV --> AG --> CH
+
+    CH --> E1([END])
+    T --> E2([END])
+    NR --> E3([END])
+```
+
+Solid arrows are the normal path. Dotted arrows are optional branches.
+
+### Nodes
+
+| Node | Kind | What it does | Writes to state |
+|---|---|---|---|
+| `council_member` | LLM call, once per model | Sends the user's question to one council model | `stage1` (or `failed_models`) |
+| `title` | LLM call | Generates a 3–5 word conversation title (first message only) | `title` |
+| `prepare_review` | Python | Waits for all Stage 1 answers, labels them *Response A, B, C…*, and builds one shared review prompt | `label_to_model`, `ranking_prompt` |
+| `reviewer` | LLM call, once per model | One model evaluates and ranks the anonymized answers; the ranking is parsed from its `FINAL RANKING:` section | `stage2` (or `failed_models`) |
+| `aggregate` | Python | Averages each model's position across all reviews (lower is better) | `aggregate_rankings` |
+| `chairman` | LLM call | The Chairman writes the final answer from all answers and reviews | `stage3` |
+| `no_responses` | Python | Fallback when every model failed in Stage 1 | `stage3` (error message) |
+
+### Routing
+
+| From | Router function | Goes to |
+|---|---|---|
+| `START` | `dispatch_council` | One `Send("council_member")` per model, plus `Send("title")` on the first message of a conversation |
+| `prepare_review` | `dispatch_reviewers` | One `Send("reviewer")` per model, or `no_responses` if Stage 1 produced nothing |
+
+All other edges are fixed. `Send` is LangGraph's way of launching the **same node several times in parallel**, each with its own input (here, `{model, prompt}`).
+
+### State (`CouncilState`)
+
+| Key | Written by | How updates combine |
+|---|---|---|
+| `user_query`, `generate_title` | Input | — |
+| `stage1` | `council_member` | **Merged** from all parallel tasks, kept in `COUNCIL_MODELS` order |
+| `stage2` | `reviewer` | **Merged** the same way |
+| `failed_models` | `council_member`, `reviewer` | **Appended** (`operator.add`) |
+| `label_to_model`, `ranking_prompt` | `prepare_review` | Overwritten |
+| `aggregate_rankings` | `aggregate` / `no_responses` | Overwritten |
+| `stage3` | `chairman` / `no_responses` | Overwritten |
+| `title` | `title` | Overwritten |
+
+Parallel tasks write to the same key at the same moment, so `stage1`, `stage2` and `failed_models` use **reducers** that combine the results instead of overwriting them.
+
+### How a run executes
+
+LangGraph runs the graph in **supersteps**. All tasks in a step run concurrently, and the next step starts once they have all finished.
+
+| Step | Runs | Waiting on LLMs? |
+|---|---|---|
+| 1 | `council_member` × 4 **and** `title`, in parallel | ✅ |
+| 2 | `prepare_review` | — |
+| 3 | `reviewer` × 4, in parallel | ✅ |
+| 4 | `aggregate` | — |
+| 5 | `chairman` | ✅ |
+
+With 4 council models, one question makes **10 LLM calls** (4 answers + 4 reviews + 1 chairman + 1 title) but only **3 rounds of waiting**, because each round runs in parallel.
+
+### Streaming to the UI
+
+[`frontend/runner.py`](frontend/runner.py) runs the graph with `council_graph.astream(inputs, stream_mode=["updates", "values"])`:
+
+- **`updates`** emits an event each time a node finishes, which becomes a live progress line (e.g. *"✅ Stage 1 · gpt-5.1 answered"*).
+- **`values`** emits the full state after each step; the last one is the final result that gets saved.
+
+### Failure handling
+
+- If a model errors or times out, `query_model` returns `None`, the node records the model in `failed_models`, and the graph carries on without it.
+- If some reviewers fail, the leaderboard is built from the reviews that did arrive.
+- If **every** model fails in Stage 1, the graph routes to `no_responses` and shows an error.
+- If the chairman fails, Stage 3 shows an error message, but the Stage 1 and 2 results are still displayed.
 
 ---
 
