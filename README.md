@@ -255,6 +255,3 @@ With 4 council models, one question makes **10 LLM calls** (4 answers + 4 review
 
 ---
 
-## 🙏 Credits
-
-Inspired by [karpathy/llm-council](https://github.com/karpathy/llm-council), rebuilt here with a LangGraph backend and a Streamlit frontend.
